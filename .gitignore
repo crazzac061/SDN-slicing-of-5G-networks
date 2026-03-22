@@ -1,0 +1,17 @@
+# Ignore everything by default
+/*
+
+# Allow the .gitignore file itself
+!/.gitignore
+
+# Allow the ns-3.40 directory and its scratch subdirectory
+!/ns-3.40/
+/ns-3.40/*
+!/ns-3.40/scratch/
+
+# Ignore common build and temporary artifacts inside scratch just in case
+**/__pycache__/
+**/*.pyc
+**/*.o
+**/build/
+**/results/
