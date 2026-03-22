@@ -1,28 +1,6 @@
 /* =============================================================================
  * slice-simulation.cc
- * 5G Network Slicing Simulation — Infrastructure + Control Layer
- *
- * FIXES APPLIED:
- *   Bug 1 — Scheduler retrieval: GetObject<>() → DynamicCast<>()
- *            GetObject traverses ns-3 aggregation chains; DynamicCast does a
- *            proper C++ dynamic_cast.  GetObject returned nullptr every time,
- *            so the g_scheduler[] pointers were never set and weights were
- *            never applied to the actual schedulers.
- *
- *   Bug 2 — OpenGym interface setup: removed the erroneous
- *            SetGetObservationSpaceCb() call on a throwaway SliceGymEnv.
- *            SetOpenGymInterface() on the real gymEnv registers all callbacks
- *            automatically through the OpenGymEnv base class.
- *
- *   Bug 3 — UE position allocators: eMBB UEs now centred on their gNB at
- *            (50, 0) and mMTC UEs centred on their gNB at (100, 0), not both
- *            at origin (0, 0).  Previously almost all mMTC UEs were >900 m
- *            from their gNB, causing very poor SINR / disconnected UEs.
- *
- *   ApplyWeights redesign: changed to call SetWeight() (single weight per
- *            instance) instead of SetSliceWeight(bwpId, …) with the old
- *            3-element array.  Multiply normalised weight by NUM_SLICES so
- *            the neutral value 1/3 maps to weight=1.0 for each scheduler.
+ * 5G Network Slicing Simulation — Infrastructure + Control Layer.
  * ============================================================================= */
 
 #include "nr-mac-scheduler-weighted-pf.h"
@@ -550,14 +528,7 @@ main(int argc, char* argv[])
 
     // -----------------------------------------------------------------------
     // 8. Retrieve scheduler pointers for weight updates
-    // -----------------------------------------------------------------------
-    // FIX Bug 1: was sched->GetObject<NrMacSchedulerWeightedPF>()
-    //            GetObject() traverses ns-3 aggregation — not a cast.
-    //            DynamicCast<T>() is the correct way to downcast a pointer.
-    //
-    // Note: NrHelper::GetScheduler(Ptr<NetDevice>, uint32_t bwpId) is an
-    //       INSTANCE method in ns-3.40 5G-LENA.  If your build reports
-    //       "not a member" for the instance call, use the fallback below.
+
     // -----------------------------------------------------------------------
     auto GetSchedPtr = [&](Ptr<NetDevice> gnbDev) -> Ptr<NrMacSchedulerWeightedPF> {
         // Primary: instance method (5G-LENA v2.x / ns-3.40)
@@ -585,11 +556,6 @@ main(int argc, char* argv[])
     // -----------------------------------------------------------------------
     internet.Install(allUes);
 
-    // FIX: Manual IP assignment using a local Ipv4AddressHelper.
-    // epcHelper->AssignUeIpv4Address() is a convenience wrapper around a private
-    // address helper. Since SetUeAddressHelper() is not accessible, we assign
-    // the addresses manually here. The EpcHelper will automatically pick them
-    // up when the default bearers are activated during attachment.
     Ipv4AddressHelper ueIpHelper;
 
     ueIpHelper.SetBase("7.0.1.0", "255.255.255.0");
@@ -653,13 +619,7 @@ main(int argc, char* argv[])
     // -----------------------------------------------------------------------
     // 13. OpenGym / ns3-gym setup
     // -----------------------------------------------------------------------
-    // FIX Bug 2: Create gymEnv FIRST, configure it, THEN connect interface.
-    //            The original code called SetGetObservationSpaceCb() on a
-    //            throwaway CreateObject<SliceGymEnv>() — that object was
-    //            immediately discarded and had nothing to do with gymEnv.
-    //            SetOpenGymInterface() registers all required callbacks
-    //            automatically through the OpenGymEnv base class.
-
+    //
     Ptr<SliceGymEnv> gymEnv = CreateObject<SliceGymEnv>();
     gymEnv->SetAttribute("StepInterval", DoubleValue(stepInterval));
     gymEnv->SetAttribute("MaxSteps", UintegerValue(static_cast<uint32_t>(simTime / stepInterval)));

@@ -25,9 +25,11 @@
 
 #include "ns3/nr-mac-scheduler-ofdma-pf.h"
 #include "ns3/object.h"
+
 #include <cstdint>
 
-namespace ns3 {
+namespace ns3
+{
 
 /**
  * \ingroup scheduler
@@ -45,11 +47,11 @@ namespace ns3 {
  */
 class NrMacSchedulerWeightedPF : public NrMacSchedulerOfdmaPF
 {
-public:
-    static TypeId GetTypeId ();
+  public:
+    static TypeId GetTypeId();
 
-    NrMacSchedulerWeightedPF ();
-    ~NrMacSchedulerWeightedPF () override = default;
+    NrMacSchedulerWeightedPF();
+    ~NrMacSchedulerWeightedPF() override = default;
 
     // -----------------------------------------------------------------------
     // Primary API: single weight per scheduler instance
@@ -65,10 +67,13 @@ public:
      * channel conditions, effectively granting more frequent high-rate
      * allocations.
      */
-    void SetWeight (double weight);
+    void SetWeight(double weight);
 
     /** \return Current raw weight (before clamping) */
-    double GetWeight () const { return m_weight; }
+    double GetWeight() const
+    {
+        return m_weight;
+    }
 
     // -----------------------------------------------------------------------
     // Backward-compatible multi-index API (used by existing ApplyWeights code)
@@ -79,20 +84,20 @@ public:
      * \brief Set weight; bwpId is accepted for API compatibility but ignored.
      * The caller should only pass the index matching this scheduler's BWP.
      */
-    void   SetSliceWeight (uint8_t bwpId, double weight);
-    double GetSliceWeight (uint8_t bwpId) const;
+    void SetSliceWeight(uint8_t bwpId, double weight);
+    double GetSliceWeight(uint8_t bwpId) const;
 
     // Attribute-friendly wrappers (no index parameter)
-    void   SetSliceWeightAttr (double weight);
-    double GetSliceWeightAttr () const;
+    void SetSliceWeightAttr(double weight);
+    double GetSliceWeightAttr() const;
 
     static constexpr double BASE_WINDOW_MS = 99.0; // default PF time window [ms]
 
-private:
-    double m_weight {1.0}; ///< Current slice weight (1.0 = neutral)
+  private:
+    double m_weight{1.0}; ///< Current slice weight (1.0 = neutral)
 
     /** Translate m_weight → PF TimeWindow attribute and apply it. */
-    void ApplyWeightAsTimeWindow ();
+    void ApplyWeightAsTimeWindow();
 };
 
 } // namespace ns3
