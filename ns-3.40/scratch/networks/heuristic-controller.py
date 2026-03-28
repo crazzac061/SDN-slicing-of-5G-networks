@@ -165,6 +165,10 @@ class HeuristicController:
         self.weight_history: List[np.ndarray]     = []
         self.reward_history: List[float]          = []
 
+        # EWMA for throughput smoothing (Bug 5)
+        self.ema_tput = np.zeros(NUM_SLICES)
+        self.alpha_ema = 0.2  # Smoothing factor
+
     def compute_action(self, kpis: List[SliceKPI]) -> np.ndarray:
         """
         Override in subclasses to produce weight vector [w0, w1, w2] ∈ [0,1]³.
@@ -175,6 +179,16 @@ class HeuristicController:
     def step(self, obs: np.ndarray, reward: float) -> np.ndarray:
         """Main entry point: parse obs → compute action → log → return action."""
         kpis = parse_observation(obs)
+        
+        # Apply EWMA smoothing to throughput
+        if self.step_count == 0:
+            for s in range(NUM_SLICES):
+                self.ema_tput[s] = kpis[s].throughput_mbps
+        else:
+            for s in range(NUM_SLICES):
+                self.ema_tput[s] = (1 - self.alpha_ema) * self.ema_tput[s] + self.alpha_ema * kpis[s].throughput_mbps
+                kpis[s].throughput_mbps = self.ema_tput[s]
+
         self.kpi_history.append(kpis)
         self.reward_history.append(reward)
 

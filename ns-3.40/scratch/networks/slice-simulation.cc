@@ -20,6 +20,8 @@
 #include "ns3/point-to-point-module.h"
 
 // ns-3 NR (5G-LENA)
+#include "ns3/epc-ue-nas.h"
+#include "ns3/lte-module.h"
 #include "ns3/nr-module.h"
 
 #include <cstdlib>
@@ -350,10 +352,11 @@ main(int argc, char* argv[])
     // 3. Mobility (Fixed grid layout for NetAnim)
     // -----------------------------------------------------------------------
     // Seed for reproducibility
-    srand(time(NULL));
+    Ptr<UniformRandomVariable> rng = CreateObject<UniformRandomVariable>();
 
     // -- gNBs: Use separate nodes at the SAME POSITION (Co-located) --
     MobilityHelper mobility;
+    mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
     Ptr<ListPositionAllocator> gnbPos = CreateObject<ListPositionAllocator>();
     gnbPos->Add(Vector(200.0, 200.0, 25.0)); // Single central site for all BWPs/Slices
     mobility.SetPositionAllocator(gnbPos);
@@ -371,8 +374,8 @@ main(int argc, char* argv[])
     Ptr<ListPositionAllocator> uePos = CreateObject<ListPositionAllocator>();
     for (uint32_t i = 0; i < nUrllc + nMmtc; i++)
     {
-        double x = rand() % 400;
-        double y = rand() % 400;
+        double x = rng->GetValue(0.0, 399.0);
+        double y = rng->GetValue(0.0, 399.0);
         uePos->Add(Vector(x, y, 1.5));
     }
     mobility.SetPositionAllocator(uePos);
@@ -382,20 +385,27 @@ main(int argc, char* argv[])
 
     // -- eMBB: Constrained mobility to the middle of the cell (100-300m range) --
     MobilityHelper embbMobility;
-    embbMobility.SetMobilityModel("ns3::RandomWaypointMobilityModel",
-                                  "Speed",
-                                  StringValue("ns3::UniformRandomVariable[Min=1.0|Max=3.0]"),
-                                  "Pause",
-                                  StringValue("ns3::UniformRandomVariable[Min=2.0|Max=8.0]"));
 
     Ptr<ListPositionAllocator> embbPos = CreateObject<ListPositionAllocator>();
     for (uint32_t i = 0; i < nEmbb; i++)
     {
-        double x = 100.0 + (rand() % 200); // 100-300 range
-        double y = 100.0 + (rand() % 200); // 100-300 range
+        double x = rng->GetValue(100.0, 300.0); // 100-300 range
+        double y = rng->GetValue(100.0, 300.0); // 100-300 range
         embbPos->Add(Vector(x, y, 1.5));
     }
     embbMobility.SetPositionAllocator(embbPos);
+
+    Ptr<RandomRectanglePositionAllocator> embbWaypointAlloc = CreateObject<RandomRectanglePositionAllocator>();
+    embbWaypointAlloc->SetX(CreateObjectWithAttributes<UniformRandomVariable>("Min", DoubleValue(100.0), "Max", DoubleValue(300.0)));
+    embbWaypointAlloc->SetY(CreateObjectWithAttributes<UniformRandomVariable>("Min", DoubleValue(100.0), "Max", DoubleValue(300.0)));
+
+    embbMobility.SetMobilityModel("ns3::RandomWaypointMobilityModel",
+                                  "Speed",
+                                  StringValue("ns3::UniformRandomVariable[Min=1.0|Max=3.0]"),
+                                  "Pause",
+                                  StringValue("ns3::UniformRandomVariable[Min=2.0|Max=8.0]"),
+                                  "PositionAllocator", PointerValue(embbWaypointAlloc));
+
     embbMobility.Install(embbUes);
 
     // Ensure all eMBB UEs have correct Z coordinate
@@ -477,7 +487,10 @@ main(int argc, char* argv[])
     nrHelper->InitializeOperationBand(&embbBand);
     nrHelper->InitializeOperationBand(&mmtcBand);
 
-    BandwidthPartInfoPtrVector allBwps = CcBwpCreator::GetAllBwps({urllcBand, embbBand, mmtcBand});
+    BandwidthPartInfoPtrVector allBwps;
+    allBwps.push_back(urllcBand.m_cc.at(0)->m_bwp.at(0));
+    allBwps.push_back(embbBand.m_cc.at(0)->m_bwp.at(0));
+    allBwps.push_back(mmtcBand.m_cc.at(0)->m_bwp.at(0));
 
     BandwidthPartInfoPtrVector urllcBwps;
     urllcBwps.push_back(allBwps.at(0));
@@ -503,31 +516,17 @@ main(int argc, char* argv[])
     // BWP 2: mMTC (15 kHz SCS)
     gnbDev->GetPhy(2)->SetAttribute("Numerology", UintegerValue(0));
 
-    // Install UE devices (one per slice type, each with its own BWP)
+    // -----------------------------------------------------------------------
+    // 8. Create, Configure and Install UEs
+    // -----------------------------------------------------------------------
+    nrHelper->SetUeBwpManagerAlgorithmAttribute("NGBR_VIDEO_TCP_DEFAULT", UintegerValue(0));
     NetDeviceContainer ueDevUrllc = nrHelper->InstallUeDevice(urllcUes, allBwps);
+
+    nrHelper->SetUeBwpManagerAlgorithmAttribute("NGBR_VIDEO_TCP_DEFAULT", UintegerValue(1));
     NetDeviceContainer ueDevEmbb = nrHelper->InstallUeDevice(embbUes, allBwps);
+
+    nrHelper->SetUeBwpManagerAlgorithmAttribute("NGBR_VIDEO_TCP_DEFAULT", UintegerValue(2));
     NetDeviceContainer ueDevMmtc = nrHelper->InstallUeDevice(mmtcUes, allBwps);
-
-    // URLLC UEs → BWP 0
-    for (uint32_t i = 0; i < ueDevUrllc.GetN(); ++i)
-    {
-        Ptr<NetDevice> dev = ueDevUrllc.Get(i);
-        NrHelper::GetBwpManagerUe(dev)->SetOutputLink(0, 0);
-    }
-
-    // eMBB UEs → BWP 1
-    for (uint32_t i = 0; i < ueDevEmbb.GetN(); ++i)
-    {
-        Ptr<NetDevice> dev = ueDevEmbb.Get(i);
-        NrHelper::GetBwpManagerUe(dev)->SetOutputLink(0, 1);
-    }
-
-    // mMTC UEs → BWP 2
-    for (uint32_t i = 0; i < ueDevMmtc.GetN(); ++i)
-    {
-        Ptr<NetDevice> dev = ueDevMmtc.Get(i);
-        NrHelper::GetBwpManagerUe(dev)->SetOutputLink(0, 2);
-    }
 
     // Update configs
     gnbDev->UpdateConfig();
