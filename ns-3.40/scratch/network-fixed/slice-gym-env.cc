@@ -4,6 +4,7 @@
 // =============================================================================
 
 #include "slice-gym-env.h"
+#include "nr-mac-scheduler-two-level-pf.h"
 
 #include "ns3/double.h"
 #include "ns3/log.h"
@@ -13,8 +14,9 @@
 
 #include <algorithm>
 #include <cmath>
-#include <iomanip> // FIX Bug 4: needed for std::setprecision / std::fixed
+#include <iomanip>
 #include <numeric>
+#include <set>
 #include <sstream>
 
 namespace ns3
@@ -126,21 +128,9 @@ SliceGymEnv::ScheduleNextStateRead()
 // ---------------------------------------------------------------------------
 
 void
-SliceGymEnv::SlotStatsTraceSink(uint32_t sliceId,
-                                const SfnSf& sfnSf,
-                                uint32_t scheduledUe,
-                                uint32_t usedReg,
-                                uint32_t usedSym,
-                                uint32_t availableRb,
-                                uint32_t availableSym,
-                                uint16_t bwpId,
-                                uint16_t cellId)
+SliceGymEnv::SetMacScheduler(Ptr<NrMacSchedulerTwoLevelPF> sched)
 {
-    if (sliceId < NUM_SLICES)
-    {
-        m_usedPrbReg[sliceId] += usedReg;
-        m_availablePrbReg[sliceId] += (uint64_t)availableRb * availableSym;
-    }
+    m_scheduler = sched;
 }
 
 void
@@ -162,6 +152,7 @@ SliceGymEnv::CollectTelemetry()
 
         std::array<double, NUM_SLICES> totalDelay{};
         std::array<uint32_t, NUM_SLICES> delayCount{};
+        std::array<std::set<FlowId>, NUM_SLICES> activeFlows{}; // To count unique UEs
 
         for (const auto& [fid, fs] : stats)
         {
@@ -170,7 +161,8 @@ SliceGymEnv::CollectTelemetry()
             int8_t sliceId = -1;
             for (uint8_t s = 0; s < NUM_SLICES; ++s)
             {
-            
+                // FIX Bug 5: was  dst == net.CombineMask(mask)
+                //            now  dst.CombineMask(mask) == net
                 if (IsInSlice(s, t.sourceAddress, t.destinationAddress))
                 {
                     sliceId = s;
@@ -180,6 +172,8 @@ SliceGymEnv::CollectTelemetry()
             if (sliceId < 0)
                 continue;
 
+            activeFlows[sliceId].insert(fid);
+
             uint64_t prevRxBytes = 0;
             uint32_t prevRxPkts = 0;
             uint32_t prevLostPkts = 0;
@@ -187,7 +181,8 @@ SliceGymEnv::CollectTelemetry()
 
             if (m_prevStats.count(fid))
             {
-                const auto& p = m_prevStats.at(fid);
+                // Const-safe access (at() would throw, but we know it exists now)
+                const auto& p = m_prevStats.find(fid)->second;
                 prevRxBytes = p.rxBytes;
                 prevRxPkts = p.rxPackets;
                 prevLostPkts = p.lostPackets;
@@ -197,7 +192,11 @@ SliceGymEnv::CollectTelemetry()
             uint64_t deltaBytes = fs.rxBytes - prevRxBytes;
             double deltaBits = static_cast<double>(deltaBytes) * 8.0;
 
-            m_kpis[sliceId].throughputMbps += (deltaBits / dt) / 1e6;
+            // FIX: Removed 0.5 correction factor since FlowMonitor is now installed 
+            // only on terminal nodes (RemoteHost & UEs) to avoid hop doubling.
+            constexpr double CORRECTION_FACTOR = 1.0;
+            m_kpis[sliceId].throughputMbps += (deltaBits / dt * CORRECTION_FACTOR) / 1e6;
+
             m_kpis[sliceId].rxPackets += fs.rxPackets - prevRxPkts;
             m_kpis[sliceId].lostPackets += fs.lostPackets - prevLostPkts;
 
@@ -210,31 +209,37 @@ SliceGymEnv::CollectTelemetry()
             }
         }
 
-        // Average delay per slice [ms]
+        // Finalize slice KPIs
         for (uint8_t s = 0; s < NUM_SLICES; ++s)
         {
             if (delayCount[s] > 0)
                 m_kpis[s].avgDelayMs = (totalDelay[s] / delayCount[s]) * 1e3;
+
+            m_kpis[s].activeUes = activeFlows[s].size();
+            if (m_kpis[s].activeUes > 0)
+            {
+                m_kpis[s].avgThroughputMbps = m_kpis[s].throughputMbps / m_kpis[s].activeUes;
+            }
         }
 
         m_prevStats = stats;
         m_prevTime = now;
     }
 
-    for (uint8_t s = 0; s < NUM_SLICES; ++s)
+    if (m_scheduler)
     {
-        if (m_availablePrbReg[s] > 0)
+        uint32_t totalPrb = m_scheduler->GetAndResetTotalRbg();
+        for (uint8_t s = 0; s < NUM_SLICES; ++s)
         {
-            m_kpis[s].prbUtilization = static_cast<double>(m_usedPrbReg[s]) / m_availablePrbReg[s];
+            if (totalPrb > 0)
+                m_kpis[s].prbUtilization = static_cast<double>(m_scheduler->GetAndResetUsedRbg(s)) / totalPrb;
+            else
+                m_kpis[s].prbUtilization = 0.0;
         }
-        else
-        {
-            m_kpis[s].prbUtilization = 0.0;
-        }
-
-        // Reset counters for the next step interval
-        m_usedPrbReg[s] = 0;
-        m_availablePrbReg[s] = 0;
+    }
+    else
+    {
+        for (uint8_t s = 0; s < NUM_SLICES; ++s) m_kpis[s].prbUtilization = 0.0;
     }
 
     // Log KPIs
@@ -243,7 +248,8 @@ SliceGymEnv::CollectTelemetry()
         static const char* names[] = {"URLLC", "eMBB ", "mMTC "};
         NS_LOG_INFO("[" << names[s] << "] "
                         << "tput=" << std::fixed << std::setprecision(2) << m_kpis[s].throughputMbps
-                        << " Mbps  "
+                        << " Mbps (Avg=" << m_kpis[s].avgThroughputMbps << " Mbps/UE, "
+                        << "UEs=" << m_kpis[s].activeUes << ")  "
                         << "delay=" << m_kpis[s].avgDelayMs << " ms  "
                         << "prb_util=" << m_kpis[s].prbUtilization);
     }
@@ -316,7 +322,8 @@ SliceGymEnv::GetObservation()
 
     for (uint8_t s = 0; s < NUM_SLICES; ++s)
     {
-        obs->AddValue(static_cast<float>(m_kpis[s].throughputMbps));
+        // Switch to Average Throughput per UE for Python controller observations
+        obs->AddValue(static_cast<float>(m_kpis[s].avgThroughputMbps));
         obs->AddValue(static_cast<float>(m_kpis[s].avgDelayMs));
         obs->AddValue(static_cast<float>(m_kpis[s].prbUtilization));
     }
@@ -337,9 +344,11 @@ SliceGymEnv::GetReward()
         const auto& sla_s = m_sla[s];
         double sliceViol = 0.0;
 
-        if (sla_s.minThroughputMbps > 0 && kpi_s.throughputMbps < sla_s.minThroughputMbps)
+        // Compare average per-UE throughput against the SLA target
+        if (sla_s.minThroughputMbps > 0 && kpi_s.avgThroughputMbps < sla_s.minThroughputMbps)
         {
-            sliceViol += (sla_s.minThroughputMbps - kpi_s.throughputMbps) / sla_s.minThroughputMbps;
+            sliceViol +=
+                (sla_s.minThroughputMbps - kpi_s.avgThroughputMbps) / sla_s.minThroughputMbps;
         }
 
         if (kpi_s.avgDelayMs > sla_s.maxDelayMs && kpi_s.avgDelayMs > 0)
@@ -356,6 +365,10 @@ SliceGymEnv::GetReward()
         double compliance = std::max(0.0, 1.0 - sliceViol);
         totalReward += std::log1p(compliance); // log(1 + compliance)
     }
+
+    // Safety check for NaN or infinite reward
+    if (std::isnan(totalReward) || std::isinf(totalReward))
+        totalReward = 0.0;
 
     NS_LOG_INFO("Step " << m_stepCount << "  reward=" << totalReward);
     return static_cast<float>(totalReward);

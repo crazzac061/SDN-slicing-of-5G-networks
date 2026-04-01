@@ -1,0 +1,24 @@
+build_exec(
+  EXECNAME
+    network-fixed
+  SOURCE_FILES
+    slice-simulation.cc
+    slice-gym-env.cc
+    nr-mac-scheduler-two-level-pf.cc
+  HEADER_FILES
+    slice-gym-env.h
+    nr-mac-scheduler-two-level-pf.h
+  LIBRARIES_TO_LINK
+    ${libcore}
+    ${libnetwork}
+    ${libinternet}
+    ${libmobility}
+    ${libapplications}
+    ${libflow-monitor}
+    ${libpoint-to-point}
+    ${libnr}
+    ${libopengym}
+    ${libnetanim}
+  EXECUTABLE_DIRECTORY_PATH
+    scratch/network-fixed/
+)

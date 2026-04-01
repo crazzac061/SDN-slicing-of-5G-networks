@@ -34,6 +34,8 @@
 namespace ns3
 {
 
+class NrMacSchedulerTwoLevelPF;
+
 // ---------------------------------------------------------------------------
 // Slice index constants — used everywhere for clarity
 // ---------------------------------------------------------------------------
@@ -47,11 +49,13 @@ constexpr uint8_t NUM_SLICES = 3;
 // ---------------------------------------------------------------------------
 struct SliceKPI
 {
-    double throughputMbps{0.0}; ///< Aggregate DL throughput [Mbps]
-    double avgDelayMs{0.0};     ///< Mean end-to-end delay [ms]
-    double prbUtilization{0.0}; ///< PRB utilisation fraction [0,1]
-    uint32_t rxPackets{0};      ///< Packets successfully received
-    uint32_t lostPackets{0};    ///< Packets lost
+    double throughputMbps{0.0};    ///< Aggregate DL throughput [Mbps]
+    double avgThroughputMbps{0.0}; ///< Per-UE mean throughput [Mbps]
+    double avgDelayMs{0.0};        ///< Mean end-to-end delay [ms]
+    double prbUtilization{0.0};    ///< PRB utilisation fraction [0,1]
+    uint32_t rxPackets{0};         ///< Packets successfully received
+    uint32_t lostPackets{0};       ///< Packets lost
+    uint32_t activeUes{0};         ///< Number of active UEs detected in this slice
 };
 
 // ---------------------------------------------------------------------------
@@ -136,20 +140,11 @@ class SliceGymEnv : public OpenGymEnv
     std::string GetExtraInfo() override;
     bool ExecuteActions(Ptr<OpenGymDataContainer> action) override;
 
-    /**
-     * Trace sink for SlotDataStats and SlotCtrlStats.
-     */
-    void SlotStatsTraceSink(uint32_t sliceId,
-                            const SfnSf& sfnSf,
-                            uint32_t scheduledUe,
-                            uint32_t usedReg,
-                            uint32_t usedSym,
-                            uint32_t availableRb,
-                            uint32_t availableSym,
-                            uint16_t bwpId,
-                            uint16_t cellId);
+    // Enable direct telemetry polling from the Two-Level MAC Scheduler
+    void SetMacScheduler(Ptr<NrMacSchedulerTwoLevelPF> sched);
 
   private:
+    Ptr<NrMacSchedulerTwoLevelPF> m_scheduler;
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
@@ -177,7 +172,7 @@ class SliceGymEnv : public OpenGymEnv
     double m_prevTime{0.0}; ///< Simulation time at previous step [s]
 
     // Interval between gym steps [s]
-    double m_stepInterval{0.1};
+    double m_stepInterval{0.01};
 
     // Weight setter callback
     WeightSetterCb m_weightSetterCb;

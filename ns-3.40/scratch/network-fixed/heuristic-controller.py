@@ -129,13 +129,7 @@ def throughput_violation(kpi: SliceKPI, sla: SliceSLA) -> float:
 def delay_violation(kpi: SliceKPI, sla: SliceSLA) -> float:
     """Returns ≥0 normalised excess delay (0 = no violation)."""
     if kpi.avg_delay_ms <= 0:
-        # If the simulator reports 0 delay but throughput is basically zero despite
-        # heartbeat traffic being active, it means 100% of packets were dropped 
-        # (complete PRB starvation). This is an infinite delay, so return max violation.
-        if kpi.throughput_mbps < 0.001:
-            return 1.0 
         return 0.0
-        
     excess = kpi.avg_delay_ms - sla.max_delay_ms
     return max(0.0, excess / sla.max_delay_ms)
 
@@ -171,10 +165,9 @@ class HeuristicController:
         self.weight_history: List[np.ndarray]     = []
         self.reward_history: List[float]          = []
 
-        # EWMA for throughput smoothing (Bug 5) and delay smoothing
+        # EWMA for throughput smoothing (Bug 5)
         self.ema_tput = np.zeros(NUM_SLICES)
-        self.ema_dly = np.zeros(NUM_SLICES)
-        self.alpha_ema = 0.2  # Smoothing factor
+        self.alpha_ema = 0.5  # IMPROVEMENT: 0.5 for better responsiveness during start
 
     def compute_action(self, kpis: List[SliceKPI]) -> np.ndarray:
         """
@@ -187,34 +180,21 @@ class HeuristicController:
         """Main entry point: parse obs → compute action → log → return action."""
         kpis = parse_observation(obs)
         
-        # Apply EWMA smoothing to throughput and zero-order hold for delay
+        # Apply EWMA smoothing to throughput
         if self.step_count == 0:
             for s in range(NUM_SLICES):
                 self.ema_tput[s] = kpis[s].throughput_mbps
-                self.ema_dly[s] = kpis[s].avg_delay_ms
         else:
             for s in range(NUM_SLICES):
-                # Throughput drops to 0 if idle, so EWMA decays normally
                 self.ema_tput[s] = (1 - self.alpha_ema) * self.ema_tput[s] + self.alpha_ema * kpis[s].throughput_mbps
                 kpis[s].throughput_mbps = self.ema_tput[s]
-                
-                # Delay is unknown if idle (simulator returns 0), so we apply zero-order hold
-                if kpis[s].avg_delay_ms > 0:
-                    self.ema_dly[s] = (1 - self.alpha_ema) * self.ema_dly[s] + self.alpha_ema * kpis[s].avg_delay_ms
-                
-                # If throughput indicates starvation (practically 0) but previous delay was good,
-                # we artificially inflate delay to reflect massive buffering/dropping.
-                if self.ema_tput[s] < 0.001 and self.slas[s].min_throughput_mbps > 0:
-                    self.ema_dly[s] = max(self.ema_dly[s], self.slas[s].max_delay_ms * 2.0)
-                    
-                kpis[s].avg_delay_ms = self.ema_dly[s]
 
         self.kpi_history.append(kpis)
         self.reward_history.append(reward)
 
         action = self.compute_action(kpis)
 
-        # IMPROVEMENT: epsilon-greedy noise 
+        # IMPROVEMENT: epsilon-greedy noise (Recommendation 2)
         if self.epsilon > 0:
             noise = np.random.uniform(-self.epsilon, self.epsilon, size=NUM_SLICES)
             action = action + noise
@@ -238,7 +218,7 @@ class HeuristicController:
             viol = overall_violation(k, sla)
             parts.append(
                 f"{SLICE_NAMES[s]} "
-                f"tput={k.throughput_mbps:6.2f}Mbps "
+                f"avg_tput={k.throughput_mbps:5.2f}Mbps " # Reported as per-UE avg
                 f"dly={k.avg_delay_ms:7.3f}ms "
                 f"prb={k.prb_utilization:.2f} "
                 f"viol={viol:.3f} "
@@ -384,8 +364,8 @@ class ProportionalDeficitController(HeuristicController):
            w_s ← (1-τ) * w_old + τ * w_new
 
     Parameters:
-      alpha  — weight of throughput violation in score  (default 0.4)
-      beta   — weight of delay violation in score       (default 0.6)
+      alpha  — weight of throughput violation in score  (default 0.5)
+      beta   — weight of delay violation in score       (default 0.5)
       gamma  — step gain for reallocation               (default 0.3)
       tau    — EMA smoothing factor (0=no update, 1=full update) (default 0.4)
     """

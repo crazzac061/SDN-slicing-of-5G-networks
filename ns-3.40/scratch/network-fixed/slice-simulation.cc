@@ -3,7 +3,7 @@
  * 5G Network Slicing Simulation — Infrastructure + Control Layer.
  * ============================================================================= */
 
-#include "nr-mac-scheduler-weighted-pf.h"
+#include "nr-mac-scheduler-two-level-pf.h"
 #include "slice-gym-env.h"
 
 #include "ns3/mobility-module.h"
@@ -28,12 +28,14 @@
 #include <ctime>
 #include <iomanip>
 #include <memory>
+#include <string>
+#include <vector>
 
 using namespace ns3;
 
 NS_LOG_COMPONENT_DEFINE("SliceSimulation");
 
-static Ptr<NrMacSchedulerWeightedPF> g_scheduler[3];
+static Ptr<NrMacSchedulerTwoLevelPF> g_scheduler[3];
 static AnimationInterface* g_anim = nullptr; // Global pointer for NetAnim annotations
 static uint32_t g_gnbId = 0;
 
@@ -60,19 +62,26 @@ AnnotateWeights(double wUrllc, double wEmbb, double wMmtc)
 void
 ApplyWeights(double wUrllc, double wEmbb, double wMmtc)
 {
-    constexpr double SCALE = 3.0;
+    // Validate inputs
+    if (wUrllc <= 0 || wEmbb <= 0 || wMmtc <= 0) {
+        NS_LOG_WARN("Weights must be positive. Skipping applying weights.");
+        return;
+    }
 
-    if (g_scheduler[SLICE_URLLC])
-        g_scheduler[SLICE_URLLC]->SetWeight(wUrllc * SCALE);
+    // Normalize weights into strict quotas [0.0, 1.0] for the Two-Level Scheduler
+    double totalWeight = wUrllc + wEmbb + wMmtc;
+    double qUrllc = wUrllc / totalWeight;
+    double qEmbb = wEmbb / totalWeight;
+    double qMmtc = wMmtc / totalWeight;
 
-    if (g_scheduler[SLICE_EMBB])
-        g_scheduler[SLICE_EMBB]->SetWeight(wEmbb * SCALE);
+    if (g_scheduler[SLICE_URLLC]) {
+        g_scheduler[SLICE_URLLC]->SetSliceQuota(SLICE_URLLC, qUrllc);
+        g_scheduler[SLICE_URLLC]->SetSliceQuota(SLICE_EMBB, qEmbb);
+        g_scheduler[SLICE_URLLC]->SetSliceQuota(SLICE_MMTC, qMmtc);
+    }
 
-    if (g_scheduler[SLICE_MMTC])
-        g_scheduler[SLICE_MMTC]->SetWeight(wMmtc * SCALE);
-
-    // Update NetAnim annotation
-    AnnotateWeights(wUrllc, wEmbb, wMmtc);
+    NS_LOG_INFO(std::fixed << std::setprecision(3) 
+                << "Quotas Applied: URLLC=" << qUrllc << " eMBB=" << qEmbb << " mMTC=" << qMmtc);
 }
 
 /**
@@ -112,18 +121,14 @@ InstallUdpCbr(NodeContainer ueNodes,
               double packetSizeBytes,
               double intervalSec,
               double startTime,
-              double stopTime,
-              bool installServer = true)
+              double stopTime)
 {
     ApplicationContainer serverApps, clientApps;
 
-    if (installServer)
-    {
-        UdpServerHelper udpServer(port);
-        serverApps = udpServer.Install(ueNodes);
-        serverApps.Start(Seconds(startTime));
-        serverApps.Stop(Seconds(stopTime));
-    }
+    UdpServerHelper udpServer(port);
+    serverApps = udpServer.Install(ueNodes);
+    serverApps.Start(Seconds(startTime));
+    serverApps.Stop(Seconds(stopTime));
 
     UdpClientHelper udpClient;
     udpClient.SetAttribute("MaxPackets", UintegerValue(0xFFFFFFFF));
@@ -133,7 +138,7 @@ InstallUdpCbr(NodeContainer ueNodes,
     for (uint32_t i = 0; i < ueNodes.GetN(); ++i)
     {
         udpClient.SetAttribute("RemoteAddress",
-                                AddressValue(InetSocketAddress(ueIpIface.GetAddress(i), port)));
+                               AddressValue(InetSocketAddress(ueIpIface.GetAddress(i), port)));
         ApplicationContainer ac = udpClient.Install(remoteHost);
         ac.Start(Seconds(startTime + 0.01 * i));
         ac.Stop(Seconds(stopTime));
@@ -311,6 +316,7 @@ main(int argc, char* argv[])
     uint32_t nMmtc = 20;
     bool verbose = false;
     bool pcapEnabled = false;
+    bool animEnabled = false; // NEW: Animation control
 
     CommandLine cmd(__FILE__);
     cmd.AddValue("gymPort", "OpenGym TCP port", gymPort);
@@ -321,11 +327,8 @@ main(int argc, char* argv[])
     cmd.AddValue("nMmtc", "Number of mMTC UEs", nMmtc);
     cmd.AddValue("verbose", "Enable verbose logging", verbose);
     cmd.AddValue("pcap", "Enable PCAP traces", pcapEnabled);
+    cmd.AddValue("anim", "Enable NetAnim traces (slow)", animEnabled);
     cmd.Parse(argc, argv);
-
-    // Increase the SRS Periodicity to support up to 320 UEs attached to a single gNB 
-    // (default is 40, causing RNTI-0 crashes for large deployments)
-    Config::SetDefault("ns3::LteEnbRrc::SrsPeriodicity", UintegerValue(320));
 
     if (verbose)
     {
@@ -337,6 +340,10 @@ main(int argc, char* argv[])
     NS_LOG_INFO("=== 5G Network Slicing Simulation ===");
     NS_LOG_INFO("UEs: URLLC=" << nUrllc << " eMBB=" << nEmbb << " mMTC=" << nMmtc);
     NS_LOG_INFO("simTime=" << simTime << "s  step=" << stepInterval << "s");
+
+    // Increase the SRS Periodicity to support up to 320 UEs attached to a single gNB
+    // (default is 40, causing RNTI=0 crashes for large deployments with >40 total UEs)
+    Config::SetDefault("ns3::LteEnbRrc::SrsPeriodicity", UintegerValue(320));
 
     // -----------------------------------------------------------------------
     // 2. Create nodes
@@ -373,17 +380,17 @@ main(int argc, char* argv[])
     // -- URLLC and mMTC UEs: Random initial positions with fixed Z=1.5 --
     mobility.SetMobilityModel("ns3::RandomWalk2dMobilityModel",
                               "Bounds",
-                              RectangleValue(Rectangle(0, 400, 0, 400)),
+                              RectangleValue(Rectangle(180, 220, 180, 220)), // 40m bounds for mmWave
                               "Distance",
-                              DoubleValue(2.0),
+                              DoubleValue(1.0),
                               "Speed",
-                              StringValue("ns3::UniformRandomVariable[Min=1.0|Max=5.0]"));
+                              StringValue("ns3::UniformRandomVariable[Min=1.0|Max=2.0]"));
 
     Ptr<ListPositionAllocator> uePos = CreateObject<ListPositionAllocator>();
     for (uint32_t i = 0; i < nUrllc + nMmtc; i++)
     {
-        double x = rng->GetValue(0.0, 399.0);
-        double y = rng->GetValue(0.0, 399.0);
+        double x = rng->GetValue(181.0, 219.0);
+        double y = rng->GetValue(181.0, 219.0);
         uePos->Add(Vector(x, y, 1.5));
     }
     mobility.SetPositionAllocator(uePos);
@@ -397,23 +404,30 @@ main(int argc, char* argv[])
     Ptr<ListPositionAllocator> embbPos = CreateObject<ListPositionAllocator>();
     for (uint32_t i = 0; i < nEmbb; i++)
     {
-        double x = rng->GetValue(100.0, 300.0); // 100-300 range
-        double y = rng->GetValue(100.0, 300.0); // 100-300 range
+        double x = rng->GetValue(190.0, 210.0); // Extreme proximity for mmWave testing
+        double y = rng->GetValue(190.0, 210.0);
         embbPos->Add(Vector(x, y, 1.5));
     }
     embbMobility.SetPositionAllocator(embbPos);
 
-    Ptr<RandomBoxPositionAllocator> embbWaypointAlloc = CreateObject<RandomBoxPositionAllocator>();
-    embbWaypointAlloc->SetX(CreateObjectWithAttributes<UniformRandomVariable>("Min", DoubleValue(100.0), "Max", DoubleValue(300.0)));
-    embbWaypointAlloc->SetY(CreateObjectWithAttributes<UniformRandomVariable>("Min", DoubleValue(100.0), "Max", DoubleValue(300.0)));
-    embbWaypointAlloc->SetZ(CreateObjectWithAttributes<ConstantRandomVariable>("Constant", DoubleValue(1.5)));
+    Ptr<RandomRectanglePositionAllocator> embbWaypointAlloc =
+        CreateObject<RandomRectanglePositionAllocator>();
+    embbWaypointAlloc->SetX(CreateObjectWithAttributes<UniformRandomVariable>("Min",
+                                                                              DoubleValue(180.0),
+                                                                              "Max",
+                                                                              DoubleValue(220.0)));
+    embbWaypointAlloc->SetY(CreateObjectWithAttributes<UniformRandomVariable>("Min",
+                                                                              DoubleValue(180.0),
+                                                                              "Max",
+                                                                              DoubleValue(220.0)));
 
     embbMobility.SetMobilityModel("ns3::RandomWaypointMobilityModel",
                                   "Speed",
                                   StringValue("ns3::UniformRandomVariable[Min=1.0|Max=3.0]"),
                                   "Pause",
                                   StringValue("ns3::UniformRandomVariable[Min=2.0|Max=8.0]"),
-                                  "PositionAllocator", PointerValue(embbWaypointAlloc));
+                                  "PositionAllocator",
+                                  PointerValue(embbWaypointAlloc));
 
     embbMobility.Install(embbUes);
 
@@ -440,7 +454,7 @@ main(int argc, char* argv[])
     p2ph.SetDeviceAttribute("DataRate", StringValue("10Gbps"));
     p2ph.SetChannelAttribute(
         "Delay",
-        StringValue("0.1ms")); // IMPROVEMENT: 0.1ms to allow sub-ms URLLC latency
+        StringValue("0.01ms")); // Tightened for URLLC benchmark
     p2ph.SetDeviceAttribute("Mtu", UintegerValue(1500));
 
     NetDeviceContainer internetDevices = p2ph.Install(pgw, remoteHost);
@@ -472,97 +486,99 @@ main(int argc, char* argv[])
     nrHelper->SetEpcHelper(epcHelper);
 
     // -----------------------------------------------------------------------
-    // 6. Bandwidth Parts (one per slice)
-    //    BWP 0 — URLLC:  100 MHz @ 6.0 GHz  (sub-6, FR1-High, UMa)
-    //    BWP 1 — eMBB:   100 MHz @ 3.5 GHz  (sub-6, FR1, UMa)
-    //    BWP 2 — mMTC:   10 MHz  @ 0.7 GHz  (sub-GHz, FR1, RMa)
+    // 6. Antenna and Beamforming (CRITICAL for mmWave)
+    // -----------------------------------------------------------------------
+    // gNB: 8x8 Massive MIMO panel (high gain)
+    nrHelper->SetGnbAntennaAttribute("NumRows", UintegerValue(8));
+    nrHelper->SetGnbAntennaAttribute("NumColumns", UintegerValue(8));
+    
+    // UE: 2x2 MIMO panel
+    nrHelper->SetUeAntennaAttribute("NumRows", UintegerValue(2));
+    nrHelper->SetUeAntennaAttribute("NumColumns", UintegerValue(2));
+
+    // Use Ideal Beamforming for stable SNR during testing
+    nrHelper->SetBeamformingHelper(CreateObject<IdealBeamformingHelper>());
+
+    // -----------------------------------------------------------------------
+    // 6. Bandwidth Parts (Unified Shared BWP for Slicing)
+    //    SHARED POOL: 100 MHz @ 3.5 GHz (FR1, UMa) 
+    //    Numerology 2 (60kHz SCS) -> yields 0.25ms slots for strict URLLC SLAs
     // -----------------------------------------------------------------------
     CcBwpCreator ccBwpCreator;
+    // FR2 Configuration: 28 GHz, 400 MHz Center BWP
+    CcBwpCreator::SimpleOperationBandConf sharedBandConf(28e9, 400e6, 1, BandwidthPartInfo::UMi_StreetCanyon);
 
-    CcBwpCreator::SimpleOperationBandConf urllcBandConf(6.0e9, 100e6, 1, BandwidthPartInfo::UMa);
-    CcBwpCreator::SimpleOperationBandConf embbBandConf(3.5e9, 100e6, 1, BandwidthPartInfo::UMa);
-    CcBwpCreator::SimpleOperationBandConf mmtcBandConf(700e6, 10e6, 1, BandwidthPartInfo::RMa);
+    OperationBandInfo sharedBand = ccBwpCreator.CreateOperationBandContiguousCc(sharedBandConf);
+    sharedBand.m_cc.at(0)->m_bwp.at(0)->m_bwpId = 0;
+    
+    // Explicitly set Numerology 2 (60kHz) globally via PHY attributes BEFORE initialization
+    nrHelper->SetGnbPhyAttribute("Numerology", UintegerValue(2));
 
-    OperationBandInfo urllcBand = ccBwpCreator.CreateOperationBandContiguousCc(urllcBandConf);
-    OperationBandInfo embbBand = ccBwpCreator.CreateOperationBandContiguousCc(embbBandConf);
-    OperationBandInfo mmtcBand = ccBwpCreator.CreateOperationBandContiguousCc(mmtcBandConf);
-
-    // FIX: set unique BWP IDs BEFORE InitializeOperationBand
-    urllcBand.m_cc.at(0)->m_bwp.at(0)->m_bwpId = 0;
-    embbBand.m_cc.at(0)->m_bwp.at(0)->m_bwpId = 1;
-    mmtcBand.m_cc.at(0)->m_bwp.at(0)->m_bwpId = 2;
-
-    nrHelper->InitializeOperationBand(&urllcBand);
-    nrHelper->InitializeOperationBand(&embbBand);
-    nrHelper->InitializeOperationBand(&mmtcBand);
+    nrHelper->InitializeOperationBand(&sharedBand);
 
     BandwidthPartInfoPtrVector allBwps;
-    allBwps.push_back(urllcBand.m_cc.at(0)->m_bwp.at(0));
-    allBwps.push_back(embbBand.m_cc.at(0)->m_bwp.at(0));
-    allBwps.push_back(mmtcBand.m_cc.at(0)->m_bwp.at(0));
+    allBwps.push_back(sharedBand.m_cc.at(0)->m_bwp.at(0));
 
-    BandwidthPartInfoPtrVector urllcBwps;
-    urllcBwps.push_back(allBwps.at(0));
-    BandwidthPartInfoPtrVector embbBwps;
-    embbBwps.push_back(allBwps.at(1));
-    BandwidthPartInfoPtrVector mmtcBwps;
-    mmtcBwps.push_back(allBwps.at(2));
+    // Force all slices to use the identical single BWP
+    BandwidthPartInfoPtrVector urllcBwps;  urllcBwps.push_back(allBwps.at(0));
+    BandwidthPartInfoPtrVector embbBwps;   embbBwps.push_back(allBwps.at(0));
+    BandwidthPartInfoPtrVector mmtcBwps;   mmtcBwps.push_back(allBwps.at(0));
 
-    // Extract individual containers for UE installation (order matches band vector above)
-    nrHelper->SetSchedulerTypeId(NrMacSchedulerWeightedPF::GetTypeId());
-    nrHelper->SetSchedulerAttribute("SliceWeight", DoubleValue(1.0));
+    // Set TwoLevelPF scheduler
+    nrHelper->SetSchedulerTypeId(NrMacSchedulerTwoLevelPF::GetTypeId());
     nrHelper->SetGnbPhyAttribute("TxPower", DoubleValue(43.0));
 
-    // Install single gNB device with 3 BWPs
+
+    // -----------------------------------------------------------------------
+    // 8. Configure BWP Mappings and Install Devices
+    // -----------------------------------------------------------------------
+    const std::vector<std::string> qcis = {
+        "GBR_CONV_VOICE", "GBR_CONV_VIDEO", "GBR_GAMING", "GBR_NON_CONV_VIDEO", 
+        "GBR_MC_PUSH_TO_TALK", "GBR_NMC_PUSH_TO_TALK", "GBR_MC_VIDEO", "GBR_V2X", 
+        "NGBR_IMS", "NGBR_VIDEO_TCP_OPERATOR", "NGBR_VOICE_VIDEO_GAMING", 
+        "NGBR_VIDEO_TCP_PREMIUM", "NGBR_VIDEO_TCP_DEFAULT", "NGBR_MC_DELAY_SIGNAL", 
+        "NGBR_MC_DATA", "NGBR_V2X", "NGBR_LOW_LAT_EMBB", "DGBR_DISCRETE_AUT_SMALL", 
+        "DGBR_DISCRETE_AUT_LARGE", "DGBR_ITS", "DGBR_ELECTRICITY", 
+        "GBR_LIVE_UL_71", "GBR_LIVE_UL_72", "GBR_LIVE_UL_73", "GBR_LIVE_UL_74", 
+        "GBR_LIVE_UL_76", "DGBR_INTER_SERV_87", "DGBR_INTER_SERV_88", 
+        "DGBR_VISUAL_CONTENT_89", "DGBR_VISUAL_CONTENT_90"
+    };
+
+    // CRITICAL: Map ALL QCIs to BWP 0
+    for (const auto& q : qcis) {
+        nrHelper->SetGnbBwpManagerAlgorithmAttribute(q, UintegerValue(0));
+        nrHelper->SetUeBwpManagerAlgorithmAttribute(q, UintegerValue(0));
+    }
+
     NetDeviceContainer gnbDevs = nrHelper->InstallGnbDevice(gnbNodes, allBwps);
     Ptr<NrGnbNetDevice> gnbDev = DynamicCast<NrGnbNetDevice>(gnbDevs.Get(0));
-
-    // Configure per-BWP parameters (Numerology)
-    // BWP 0: URLLC (120 kHz SCS)
-    gnbDev->GetPhy(0)->SetAttribute("Numerology", UintegerValue(3));
-    // BWP 1: eMBB (30 kHz SCS)
-    gnbDev->GetPhy(1)->SetAttribute("Numerology", UintegerValue(1));
-    // BWP 2: mMTC (15 kHz SCS)
-    gnbDev->GetPhy(2)->SetAttribute("Numerology", UintegerValue(0));
-
-    // -----------------------------------------------------------------------
-    // 8. Create, Configure and Install UEs
-    // -----------------------------------------------------------------------
-    nrHelper->SetUeBwpManagerAlgorithmAttribute("NGBR_VIDEO_TCP_DEFAULT", UintegerValue(0));
+    
     NetDeviceContainer ueDevUrllc = nrHelper->InstallUeDevice(urllcUes, allBwps);
-
-    nrHelper->SetUeBwpManagerAlgorithmAttribute("NGBR_VIDEO_TCP_DEFAULT", UintegerValue(1));
     NetDeviceContainer ueDevEmbb = nrHelper->InstallUeDevice(embbUes, allBwps);
-
-    nrHelper->SetUeBwpManagerAlgorithmAttribute("NGBR_VIDEO_TCP_DEFAULT", UintegerValue(2));
     NetDeviceContainer ueDevMmtc = nrHelper->InstallUeDevice(mmtcUes, allBwps);
 
-    // Update configs
     gnbDev->UpdateConfig();
-    auto updateUeConfigs = [](NetDeviceContainer& devs) {
-        for (auto it = devs.Begin(); it != devs.End(); ++it)
+
+    for (auto* devs : {&ueDevUrllc, &ueDevEmbb, &ueDevMmtc})
+    {
+        for (auto it = devs->Begin(); it != devs->End(); ++it)
         {
             if (auto ue = DynamicCast<NrUeNetDevice>(*it))
+            {
                 ue->UpdateConfig();
+            }
         }
-    };
-    updateUeConfigs(ueDevUrllc);
-    updateUeConfigs(ueDevEmbb);
-    updateUeConfigs(ueDevMmtc);
+    }
 
     // -----------------------------------------------------------------------
-    // 8. Retrieve scheduler pointers for weight updates
+    // 8. Retrieve scheduler pointers and setup UE Mapping
     // -----------------------------------------------------------------------
-    g_scheduler[SLICE_URLLC] =
-        DynamicCast<NrMacSchedulerWeightedPF>(nrHelper->GetScheduler(gnbDevs.Get(0), 0));
-    g_scheduler[SLICE_EMBB] =
-        DynamicCast<NrMacSchedulerWeightedPF>(nrHelper->GetScheduler(gnbDevs.Get(0), 1));
-    g_scheduler[SLICE_MMTC] =
-        DynamicCast<NrMacSchedulerWeightedPF>(nrHelper->GetScheduler(gnbDevs.Get(0), 2));
+    // All slices share exactly the SAME scheduler instance on BWP 0
+    g_scheduler[SLICE_URLLC] = DynamicCast<NrMacSchedulerTwoLevelPF>(nrHelper->GetScheduler(gnbDevs.Get(0), 0));
+    g_scheduler[SLICE_EMBB]  = g_scheduler[SLICE_URLLC]; 
+    g_scheduler[SLICE_MMTC]  = g_scheduler[SLICE_URLLC];
 
-    NS_ABORT_MSG_IF(!g_scheduler[SLICE_URLLC], "Could not retrieve URLLC scheduler from BWP 0");
-    NS_ABORT_MSG_IF(!g_scheduler[SLICE_EMBB], "Could not retrieve eMBB scheduler from BWP 1");
-    NS_ABORT_MSG_IF(!g_scheduler[SLICE_MMTC], "Could not retrieve mMTC scheduler from BWP 2");
+    NS_ABORT_MSG_IF(!g_scheduler[SLICE_URLLC], "Could not retrieve TwoLevelPF scheduler from BWP 0");
 
     // -----------------------------------------------------------------------
     // 9. Internet stack + IP addressing on UEs
@@ -588,128 +604,65 @@ main(int argc, char* argv[])
     }
 
     // -----------------------------------------------------------------------
-    // 10. Attach UEs
+    // 10. Attach UEs and Setup TwoLevelPF Slice Maps
     // -----------------------------------------------------------------------
     nrHelper->AttachToClosestEnb(ueDevUrllc, gnbDevs);
     nrHelper->AttachToClosestEnb(ueDevEmbb, gnbDevs);
     nrHelper->AttachToClosestEnb(ueDevMmtc, gnbDevs);
 
+    // 5G-LENA assigns RNTIs chronologically starting from 1 during AttachToClosestEnb
+    uint16_t currentRnti = 1;
+    for (uint32_t i = 0; i < ueDevUrllc.GetN(); ++i) g_scheduler[SLICE_URLLC]->SetUeSlice(currentRnti++, SLICE_URLLC);
+    for (uint32_t i = 0; i < ueDevEmbb.GetN(); ++i)  g_scheduler[SLICE_URLLC]->SetUeSlice(currentRnti++, SLICE_EMBB);
+    for (uint32_t i = 0; i < ueDevMmtc.GetN(); ++i)  g_scheduler[SLICE_URLLC]->SetUeSlice(currentRnti++, SLICE_MMTC);
+
     // -----------------------------------------------------------------------
-    // 11. Applications (Dynamic UE Counts & Traffic Profiles)
+    // 11. Applications
     // -----------------------------------------------------------------------
     double appStart = 1.0;
+    double appStop = simTime; // IMPROVEMENT: Run until sim ends to prevent metric collapse
 
-    // --- URLLC (Dynamic Subset) ---
-    uint32_t urllcCount0 = std::max<uint32_t>(1, nUrllc * 0.2); // 20% UEs Heartbeat
-    NodeContainer urllcSubset0;
-    for (uint32_t i = 0; i < urllcCount0; ++i) urllcSubset0.Add(urllcUes.Get(i));
+    // URLLC: tight-loop UDP CBR using unique QCI for GNB steering
+    EpsBearer urllcBearer(EpsBearer::NGBR_LOW_LAT_EMBB);
+    nrHelper->ActivateDedicatedEpsBearer(ueDevUrllc, urllcBearer, EpcTft::Default());
+    InstallUdpCbr(urllcUes, remoteHost, urllcIpIface, 3000, 512, 0.001, appStart, appStop);
 
-    uint32_t urllcCount1 = std::max<uint32_t>(1, nUrllc * 0.4); // 40% UEs Burst 1
-    NodeContainer urllcSubset1;
-    for (uint32_t i = 0; i < urllcCount1; ++i) urllcSubset1.Add(urllcUes.Get(i));
+    // eMBB: Persistent TCP bulk-send using unique QCI
+    EpsBearer embbBearer(EpsBearer::NGBR_VIDEO_TCP_DEFAULT);
+    nrHelper->ActivateDedicatedEpsBearer(ueDevEmbb, embbBearer, EpcTft::Default());
+    PacketSinkHelper sink("ns3::TcpSocketFactory", InetSocketAddress(Ipv4Address::GetAny(), 4000));
+    ApplicationContainer sinkApps = sink.Install(embbUes);
+    sinkApps.Start(Seconds(appStart));
+    sinkApps.Stop(Seconds(appStop));
 
-    // Heartbeat: 1.0s to simTime (Port 3000, 20% UEs active, 0.05 interval)
-    InstallUdpCbr(urllcSubset0, remoteHost, urllcIpIface, 3000, 512, 0.05, 1.0, simTime);
-
-    // Install servers for bursts once (Full duration)
-    UdpServerHelper server3001(3001);
-    server3001.Install(urllcSubset1).Start(Seconds(1.0));
-    UdpServerHelper server3002(3002);
-    server3002.Install(urllcUes).Start(Seconds(1.0));
-
-    for (double t = 0.0; t < simTime; t += 10.0)
+    for (uint32_t i = 0; i < nEmbb; ++i)
     {
-        // Burst 1: 1.0s to 4.0s (offset by t)
-        if (t + 4.0 <= simTime)
-            InstallUdpCbr(urllcSubset1, remoteHost, urllcIpIface, 3001, 512, 0.01, t + 1.0, t + 4.0, false);
-        // Burst 2: 6.0s to 9.0s (offset by t)
-        if (t + 9.0 <= simTime)
-            InstallUdpCbr(urllcUes, remoteHost, urllcIpIface, 3002, 512, 0.01, t + 6.0, t + 9.0, false);
+        Ptr<PersistentBulkSender> sender = CreateObject<PersistentBulkSender>();
+        sender->Setup(InetSocketAddress(embbIpIface.GetAddress(i), 4000), 1400);
+
+        remoteHost->AddApplication(sender);
+        sender->SetStartTime(Seconds(appStart + 0.01 * i));
+        sender->SetStopTime(Seconds(appStop));
     }
 
-    // --- eMBB (Dynamic Subset) ---
-    uint32_t embbCount1 = std::max<uint32_t>(1, nEmbb * 0.3); // 30% UEs baseline
-    NodeContainer embbSubset1;
-    for (uint32_t i = 0; i < embbCount1; ++i) embbSubset1.Add(embbUes.Get(i));
+    // mMTC: Low-rate periodic data using unique QCI
+    EpsBearer mmtcBearer(EpsBearer::NGBR_MC_DATA);
+    nrHelper->ActivateDedicatedEpsBearer(ueDevMmtc, mmtcBearer, EpcTft::Default());
+    InstallUdpCbr(mmtcUes, remoteHost, mmtcIpIface, 5000, 1500, 0.1, appStart, appStop);
 
-    PacketSinkHelper sinkBase("ns3::TcpSocketFactory", InetSocketAddress(Ipv4Address::GetAny(), 4000));
-    ApplicationContainer sinkAppsBase = sinkBase.Install(embbSubset1);
-    sinkAppsBase.Start(Seconds(1.0));
-    sinkAppsBase.Stop(Seconds(simTime));
-
-    for (uint32_t i = 0; i < embbSubset1.GetN(); ++i)
-    {
-        Ptr<PersistentBulkSender> senderBase = CreateObject<PersistentBulkSender>();
-        senderBase->Setup(InetSocketAddress(embbIpIface.GetAddress(i), 4000), 1400);
-        remoteHost->AddApplication(senderBase);
-        senderBase->SetStartTime(Seconds(1.0 + 0.05 * i));
-        senderBase->SetStopTime(Seconds(simTime));
-    }
-
-    // Build the surge subset (remaining 70% UEs)
-    NodeContainer embbSubset2;
-    for (uint32_t i = embbCount1; i < nEmbb; ++i) embbSubset2.Add(embbUes.Get(i));
-
-    // Surge Sink: Install ONCE for the whole duration (Port 4001)
-    PacketSinkHelper sinkSurge("ns3::TcpSocketFactory", InetSocketAddress(Ipv4Address::GetAny(), 4001));
-    ApplicationContainer sinkAppsSurge = sinkSurge.Install(embbSubset2);
-    sinkAppsSurge.Start(Seconds(1.0));
-    sinkAppsSurge.Stop(Seconds(simTime));
-
-    for (double t = 0.0; t < simTime; t += 10.0)
-    {
-        if (t + 7.5 > simTime) break;
-
-        for (uint32_t i = 0; i < embbSubset2.GetN(); ++i)
-        {
-            uint32_t ipIndex = i + embbCount1;
-            Ptr<PersistentBulkSender> senderSurge = CreateObject<PersistentBulkSender>();
-            senderSurge->Setup(InetSocketAddress(embbIpIface.GetAddress(ipIndex), 4001), 1400);
-            remoteHost->AddApplication(senderSurge);
-            senderSurge->SetStartTime(Seconds(t + 3.5 + 0.05 * i));
-            senderSurge->SetStopTime(Seconds(t + 7.5));
-        }
-    }
-
-    // --- mMTC (Dynamic Subset) ---
-    uint32_t mmtcCount0 = std::max<uint32_t>(1, nMmtc * 0.3); // 30% UEs Heartbeat
-    NodeContainer mmtcSubset0;
-    for (uint32_t i = 0; i < mmtcCount0; ++i) mmtcSubset0.Add(mmtcUes.Get(i));
-
-    uint32_t mmtcCount1 = std::max<uint32_t>(1, nMmtc * 0.5); // 50% UEs
-    NodeContainer mmtcSubset1;
-    for (uint32_t i = 0; i < mmtcCount1; ++i) mmtcSubset1.Add(mmtcUes.Get(i));
-
-    // Heartbeat: 1.0s to simTime (Port 5000, 30% UEs active, 0.5 interval)
-    InstallUdpCbr(mmtcSubset0, remoteHost, mmtcIpIface, 5000, 64, 0.5, 1.0, simTime);
-
-    // Install servers for surges once
-    UdpServerHelper server5001(5001);
-    server5001.Install(mmtcSubset1).Start(Seconds(1.0));
-    UdpServerHelper server5002(5002);
-    server5002.Install(mmtcUes).Start(Seconds(1.0));
-
-    for (double t = 0.0; t < simTime; t += 10.0)
-    {
-        // Periodic Surge 1: 2.0s to 5.0s (offset by t)
-        if (t + 5.0 <= simTime)
-            InstallUdpCbr(mmtcSubset1, remoteHost, mmtcIpIface, 5001, 64, 0.05, t + 2.0, t + 5.0, false);
-        // Periodic Surge 2: 7.5s to 9.5s (offset by t)
-        if (t + 9.5 <= simTime)
-            InstallUdpCbr(mmtcUes, remoteHost, mmtcIpIface, 5002, 64, 0.05, t + 7.5, t + 9.5, false);
-    }
-
-    // -----------------------------------------------------------------------
-    // 12. Flow Monitor
-    // -----------------------------------------------------------------------
+    // Selective FlowMonitor installation to avoid hop-doubling
     FlowMonitorHelper fmHelper;
-    Ptr<FlowMonitor> flowMonitor = fmHelper.InstallAll();
+    Ptr<FlowMonitor> flowMonitor = fmHelper.Install(urllcUes);
+    fmHelper.Install(embbUes);
+    fmHelper.Install(mmtcUes);
+    fmHelper.Install(remoteHostContainer);
     Ptr<Ipv4FlowClassifier> classifier = DynamicCast<Ipv4FlowClassifier>(fmHelper.GetClassifier());
 
     // -----------------------------------------------------------------------
     // 13. OpenGym / ns3-gym setup
     // -----------------------------------------------------------------------
     Ptr<SliceGymEnv> gymEnv = CreateObject<SliceGymEnv>();
+    gymEnv->SetMacScheduler(g_scheduler[SLICE_URLLC]);
     gymEnv->SetAttribute("StepInterval", DoubleValue(stepInterval));
     gymEnv->SetAttribute("MaxSteps", UintegerValue(static_cast<uint32_t>(simTime / stepInterval)));
 
@@ -735,30 +688,14 @@ main(int argc, char* argv[])
     gymEnv->ScheduleNextStateRead();
 
     // -----------------------------------------------------------------------
-    // PRB Telemetry Trace Connections (Bug 6 Fix)
+    // PRB Telemetry Trace Connections 
     // -----------------------------------------------------------------------
-    // We connect SlotDataStats and SlotCtrlStats from the gNB PHY (per BWP)
-    // to the GymEnv TraceSink to get accurate resource block utilization.
-    auto connectPrbTraces = [&gymEnv](Ptr<NetDevice> gnbDev) {
-        Ptr<NrGnbNetDevice> gnb = DynamicCast<NrGnbNetDevice>(gnbDev);
-        if (!gnb)
-            return;
-
-        for (uint32_t sliceId = 0; sliceId < NUM_SLICES; ++sliceId)
-        {
-            Ptr<NrGnbPhy> phy = DynamicCast<NrGnbPhy>(gnb->GetPhy(sliceId));
-            if (!phy)
-                continue;
-
-            phy->TraceConnectWithoutContext(
-                "SlotDataStats",
-                MakeCallback(&SliceGymEnv::SlotStatsTraceSink, gymEnv).Bind(sliceId));
-            phy->TraceConnectWithoutContext(
-                "SlotCtrlStats",
-                MakeCallback(&SliceGymEnv::SlotStatsTraceSink, gymEnv).Bind(sliceId));
-        }
-    };
-    connectPrbTraces(gnbDevs.Get(0));
+    // We no longer rely on PHY SlotDataStats for slicing telemetry because multiple
+    // slices share the same BWP. The PRB totals are now pulled from the TwoLevelPF
+    // scheduler directly inside `SliceGymEnv::CollectTelemetry`, or we can still wire
+    // up PHY traces for total utilization checking if needed.
+    // For now we remove the PHY connect traces to avoid polluting the telemetry, since 
+    // SliceGymEnv will directly query `g_scheduler`.
 
     // -----------------------------------------------------------------------
     // 14. Optional PCAP
@@ -769,62 +706,65 @@ main(int argc, char* argv[])
     // -----------------------------------------------------------------------
     // 15. NetAnim Trace & Configuration
     // -----------------------------------------------------------------------
-    static AnimationInterface anim("slice-simulation.xml"); // Global-ish lifecycle
-    g_anim = &anim;
-    g_gnbId = gnbNodes.Get(0)->GetId(); // The single central gNB node for all annotations
-
-    anim.EnablePacketMetadata(true);
-    anim.SetMaxPktsPerTraceFile(100000);
-    anim.SetMobilityPollInterval(
-        Seconds(0.05)); // Increase poll frequency for smoother mobility tracking
-
-    // Register node counters for real-time throughput plots
-    g_urllcResId = anim.AddNodeCounter("URLLC Tput (Mbps)", AnimationInterface::DOUBLE_COUNTER);
-    g_embbResId = anim.AddNodeCounter("eMBB Tput (Mbps)", AnimationInterface::DOUBLE_COUNTER);
-    g_mmtcResId = anim.AddNodeCounter("mMTC Tput (Mbps)", AnimationInterface::DOUBLE_COUNTER);
-
-    // gNB nodes (Blue)
-    for (uint32_t i = 0; i < gnbNodes.GetN(); ++i)
+    if (animEnabled)
     {
-        anim.UpdateNodeDescription(gnbNodes.Get(i), "gNB-" + std::to_string(i));
-        anim.UpdateNodeColor(gnbNodes.Get(i), 0, 0, 255);
-        anim.UpdateNodeSize(gnbNodes.Get(i)->GetId(), 3.0, 3.0);
-    }
-    // Remote Host & PGW (Gray)
-    anim.UpdateNodeDescription(remoteHost, "Internet");
-    anim.UpdateNodeColor(remoteHost, 128, 128, 128);
-    anim.UpdateNodeSize(remoteHost->GetId(), 3.0, 3.0);
-    anim.UpdateNodeDescription(pgw, "PGW/UPF");
-    anim.UpdateNodeColor(pgw, 128, 128, 128);
-    anim.UpdateNodeSize(pgw->GetId(), 2.5, 2.5);
+        static AnimationInterface anim("slice-simulation.xml"); // Global-ish lifecycle
+        g_anim = &anim;
+        g_gnbId = gnbNodes.Get(0)->GetId(); // The single central gNB node for all annotations
 
-    // UEs by slice
-    for (uint32_t i = 0; i < urllcUes.GetN(); ++i)
-    {
-        anim.UpdateNodeDescription(urllcUes.Get(i), "U" + std::to_string(i));
-        anim.UpdateNodeColor(urllcUes.Get(i), 255, 0, 0); // Red
-        anim.UpdateNodeSize(urllcUes.Get(i)->GetId(), 2.0, 2.0);
-    }
-    for (uint32_t i = 0; i < embbUes.GetN(); ++i)
-    {
-        anim.UpdateNodeDescription(embbUes.Get(i), "E" + std::to_string(i));
-        anim.UpdateNodeColor(embbUes.Get(i), 0, 200, 0); // Green
-        anim.UpdateNodeSize(embbUes.Get(i)->GetId(), 2.0, 2.0);
-    }
-    for (uint32_t i = 0; i < mmtcUes.GetN(); ++i)
-    {
-        anim.UpdateNodeDescription(mmtcUes.Get(i), "M" + std::to_string(i));
-        anim.UpdateNodeColor(mmtcUes.Get(i), 255, 165, 0); // Orange
-        anim.UpdateNodeSize(mmtcUes.Get(i)->GetId(), 2.0, 2.0);
-    }
+        // anim.EnablePacketMetadata(true);
+        anim.SetMaxPktsPerTraceFile(100000);
+        anim.SetMobilityPollInterval(
+            Seconds(0.05)); // Increase poll frequency for smoother mobility tracking
 
-    // Schedule periodic counter updates
-    Simulator::Schedule(Seconds(appStart + 0.1),
-                        &UpdateAnimCounters,
-                        gymEnv,
-                        urllcUes,
-                        embbUes,
-                        mmtcUes);
+        // Register node counters for real-time throughput plots
+        g_urllcResId = anim.AddNodeCounter("URLLC Tput (Mbps)", AnimationInterface::DOUBLE_COUNTER);
+        g_embbResId = anim.AddNodeCounter("eMBB Tput (Mbps)", AnimationInterface::DOUBLE_COUNTER);
+        g_mmtcResId = anim.AddNodeCounter("mMTC Tput (Mbps)", AnimationInterface::DOUBLE_COUNTER);
+
+        // gNB nodes (Blue)
+        for (uint32_t i = 0; i < gnbNodes.GetN(); ++i)
+        {
+            anim.UpdateNodeDescription(gnbNodes.Get(i), "gNB-" + std::to_string(i));
+            anim.UpdateNodeColor(gnbNodes.Get(i), 0, 0, 255);
+            anim.UpdateNodeSize(gnbNodes.Get(i)->GetId(), 3.0, 3.0);
+        }
+        // Remote Host & PGW (Gray)
+        anim.UpdateNodeDescription(remoteHost, "Internet");
+        anim.UpdateNodeColor(remoteHost, 128, 128, 128);
+        anim.UpdateNodeSize(remoteHost->GetId(), 3.0, 3.0);
+        anim.UpdateNodeDescription(pgw, "PGW/UPF");
+        anim.UpdateNodeColor(pgw, 128, 128, 128);
+        anim.UpdateNodeSize(pgw->GetId(), 2.5, 2.5);
+
+        // UEs by slice
+        for (uint32_t i = 0; i < urllcUes.GetN(); ++i)
+        {
+            anim.UpdateNodeDescription(urllcUes.Get(i), "U" + std::to_string(i));
+            anim.UpdateNodeColor(urllcUes.Get(i), 255, 0, 0); // Red
+            anim.UpdateNodeSize(urllcUes.Get(i)->GetId(), 2.0, 2.0);
+        }
+        for (uint32_t i = 0; i < nEmbb; ++i) // FIX: use nEmbb
+        {
+            anim.UpdateNodeDescription(embbUes.Get(i), "E" + std::to_string(i));
+            anim.UpdateNodeColor(embbUes.Get(i), 0, 200, 0); // Green
+            anim.UpdateNodeSize(embbUes.Get(i)->GetId(), 2.0, 2.0);
+        }
+        for (uint32_t i = 0; i < mmtcUes.GetN(); ++i)
+        {
+            anim.UpdateNodeDescription(mmtcUes.Get(i), "M" + std::to_string(i));
+            anim.UpdateNodeColor(mmtcUes.Get(i), 255, 165, 0); // Orange
+            anim.UpdateNodeSize(mmtcUes.Get(i)->GetId(), 2.0, 2.0);
+        }
+
+        // Schedule periodic counter updates
+        Simulator::Schedule(Seconds(appStart + 0.1),
+                            &UpdateAnimCounters,
+                            gymEnv,
+                            urllcUes,
+                            embbUes,
+                            mmtcUes);
+    }
 
     // -----------------------------------------------------------------------
     // 16. Run simulation
